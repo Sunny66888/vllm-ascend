@@ -18,7 +18,6 @@
 #
 import os
 from collections.abc import Callable, Sequence
-from importlib.metadata import version
 
 import numpy as np
 import torch
@@ -26,33 +25,16 @@ import vllm.v1.worker.gpu.buffer_utils
 from vllm.logger import logger
 
 
-def check_triton_ascend_version_valid() -> bool:
-    """
-    Check triton-ascend version and warn about UVA feature disablement.
-    If the installed version isn't affected by the UVA issue, return True.
-    """
-    # Triton Ascend versions affected by the UVA pointer validation issue.
-    UVA_INCOMPATIBLE_VERSIONS = ("3.2.1", "3.2.2")
-    installed_version = version("triton-ascend")
-    if installed_version in UVA_INCOMPATIBLE_VERSIONS:
-        logger.warning(
-            "triton-ascend %s disables the UVA feature.\n"
-            "Related bug issue: https://github.com/triton-lang/triton-ascend/issues/783",
-            installed_version,
-        )
-        return False
-    return True
-
-
 def is_uva_available() -> bool:
-    """check if uva feature is supported in this environment"""
-    # FIXME(chenboxun): Some triton-ascend versions reject pinned CPU tensors.
-    # Thus UVA is disabled for affected versions.
-    # (Related bug issue link: https://github.com/triton-lang/triton-ascend/issues/783)
-    return (
-        "pinned_mem_register:True" in os.environ.get("PYTORCH_NPU_ALLOC_CONF", {})
-        and check_triton_ascend_version_valid()
-    )
+    """Return whether registered pinned memory was requested.
+
+    The wrapper exposes mapped host storage as an NPU-typed tensor, so Triton
+    never receives the CPU tensor that older launchers rejected. Mapping
+    support is checked for every allocation by
+    ``get_npu_view_from_cpu_tensor``; an unavailable mapping keeps using the
+    asynchronous H2D fallback.
+    """
+    return "pinned_mem_register:True" in os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
 
 
 def get_row_indices_from_key(key: int | slice | tuple, dim_size: int) -> set[int]:
@@ -140,11 +122,11 @@ def _int64_storage(tensor: torch.Tensor) -> torch.Tensor:
 
 
 class UvaBufferWrapper:
-    """
-    Ascend NPU doesn't support UVA tensors directly.
-    This is a wrapper class that provides CPU and NPU views of a UVA tensor.
-    However if users add environment parameter below, UVA feature is Supported.
-    os.environ['PYTORCH_NPU_ALLOC_CONF'] = 'pinned_mem_register:True'
+    """Provide mapped UVA views with an explicit-copy fallback on Ascend.
+
+    Set ``PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True`` before process
+    startup to request registered pinned allocations. The runtime mapping
+    result, rather than the Triton package version, decides which path is used.
     """
 
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):

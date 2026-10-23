@@ -1518,13 +1518,18 @@
 #
 # ** 30. File: worker/patch_v2/patch_uva.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-#   1. `vllm.v1.worker.gpu.states.UvaBuffer`
+#   1. `vllm.v1.worker.gpu.buffer_utils.UvaBuffer`
 #    Why:
-#       ASCEND NPUs do not support UVA yet, so we need to wrap it in vLLM.
+#       Upstream does not provide an Ascend accelerator-view hook and its
+#       fallback does not cover every Ascend dtype or sparse-update path.
 #    How：
-#       make UvaBuffer a dummy class, mimic the interface of vllm UvaBuffer.
+#       Map registered pinned CPU storage to an NPU-typed view when the runtime
+#       supports it, otherwise copy only modified rows asynchronously to NPU.
+#    Related PR (if no, explain why):
+#       https://github.com/vllm-project/vllm/issues/50261
 #    Future Plan:
-#       Remove this patch when NPU support UVA.
+#       Remove this patch after upstream exposes platform hooks for the UVA
+#       accelerator view and fallback allocation/copy behavior.
 #
 # ** 31. File: worker/patch_v2/patch_dspark.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

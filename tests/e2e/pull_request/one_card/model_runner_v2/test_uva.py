@@ -26,11 +26,22 @@ from tests.e2e.conftest import VllmRunner
 MODELS = ["Qwen/Qwen3-0.6B"]
 
 
+class UvaProbeWorker:
+    def check_real_uva_mapping(self) -> bool:
+        # Import in the worker so the probe uses its initialized NPU context.
+        import torch
+
+        from vllm_ascend.patch.worker.patch_v2.patch_uva import UvaBufferWrapper
+
+        buffer = UvaBufferWrapper(4, torch.int32)
+        return buffer._use_real_uva and buffer.uva().device.type == "npu"
+
+
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("max_tokens", [32])
-@pytest.mark.parametrize("enforce_eager", [True])
+@pytest.mark.parametrize("enforce_eager", [True, False])
 @patch.dict(os.environ, {"VLLM_USE_V2_MODEL_RUNNER": "1", "PYTORCH_NPU_ALLOC_CONF": "pinned_mem_register:True"})
-def test_qwen3_dense_eager_mode(
+def test_qwen3_dense_eager_and_graph_mode(
     model: str,
     max_tokens: int,
     enforce_eager: bool,
@@ -56,5 +67,7 @@ def test_qwen3_dense_eager_mode(
         max_model_len=1024,
         enforce_eager=enforce_eager,
         async_scheduling=True,
+        worker_extension_cls=f"{__name__}.UvaProbeWorker",
     ) as runner:
+        assert runner.model.collective_rpc("check_real_uva_mapping") == [True]
         runner.model.generate(prompts, sampling_params)

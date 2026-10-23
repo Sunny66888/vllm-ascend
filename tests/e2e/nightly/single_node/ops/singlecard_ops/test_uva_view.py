@@ -5,7 +5,6 @@ import gc
 import importlib
 import os
 import weakref
-from importlib.metadata import PackageNotFoundError, version
 
 import numpy as np
 import pytest
@@ -23,11 +22,6 @@ except ImportError:
     triton = None
     tl = None
 
-try:
-    triton_ascend_version: str | None = version("triton-ascend")
-except PackageNotFoundError:
-    triton_ascend_version = None
-
 pytestmark = pytest.mark.skipif(
     not hasattr(torch, "npu") or not torch.npu.is_available(), reason="requires an Ascend NPU"
 )
@@ -35,10 +29,7 @@ requires_registered_pinned = pytest.mark.skipif(
     "pinned_mem_register:True" not in os.getenv("PYTORCH_NPU_ALLOC_CONF", ""),
     reason="requires mapped pinned CPU memory",
 )
-requires_triton_uva = pytest.mark.skipif(
-    triton is None or triton_ascend_version is None or triton_ascend_version in ("3.2.1", "3.2.2"),
-    reason="requires a Triton-Ascend launcher that accepts mapped host memory",
-)
+requires_triton_uva = pytest.mark.skipif(triton is None, reason="requires Triton-Ascend")
 
 
 if triton is not None:
