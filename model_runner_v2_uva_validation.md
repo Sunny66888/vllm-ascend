@@ -19,6 +19,8 @@
 | NPU | 16 张 Ascend 910，设备状态正常 |
 | 容器内 vLLM | `0.30.0` |
 | 容器内 vLLM-Ascend | `0.30.0rc2.dev10+g6d4339aa1.d20261012` |
+| 容器内 Triton-Ascend | `3.6.0+dev20261007182438` |
+| Triton UVA 判断 | 构建时间晚于修复确认时间，应已移除 `location.type` 校验；仍需源码检查和 NPU 测试确认 |
 | 分支兼容基线 | 当前 main 线对应的 vLLM `v0.31.0` 兼容逻辑 |
 | 当前代码加载方式 | 使用 `PYTHONPATH` 加载 `/data/gry/vllm-ascend` |
 | 正式推理验证 | 尚未完成 |
@@ -151,7 +153,109 @@ vllm.v1.worker.gpu.buffer_utils.UvaBuffer
 - 从跳过列表中移除 ModelRunner V2 UVA E2E 测试；
 - 将该测试的预计耗时从 80 秒调整为 160 秒。
 
-## 4. 与 vLLM 0.30.0 release 线的关系
+## 4. `triton-ascend` 版本对 UVA 的影响
+
+ModelRunner V2 的真实 UVA 路径会把注册后的 pinned CPU memory 映射成 NPU view，随后将该 view 作为参数传给 Triton kernel。部分 `triton-ascend` 版本会在启动 kernel 前检查指针对应的 `location.type`，并要求所有输入指针都属于 NPU device memory。这个检查会把 UVA 场景中的 pinned host memory 错误地拒绝掉。
+
+该问题只影响 Triton kernel 是否接受映射后的 host pointer，不代表 C++ 层的 `aclrtHostGetDevicePointer` 映射一定失败。也就是说，可能出现以下情况：
+
+```text
+CPU pinned memory 注册成功
+  -> NPU view 创建成功
+  -> Triton launcher 因 location.type 校验拒绝该指针
+```
+
+### 4.1 版本兼容性
+
+| `triton-ascend` 版本或构建 | UVA 影响 | 建议 |
+| --- | --- | --- |
+| `< 3.2.1` | 尚未引入该 `location.type` 校验，因此不受这个特定问题影响 | 版本较旧，不建议仅为 UVA 降级 |
+| `3.2.1` | 存在错误的 device-only pointer 校验，会拒绝 UVA pinned host pointer | 不用于真实 UVA |
+| 最初发布的官方 `3.2.2` wheel | 发布时仍包含该校验 | 不用于真实 UVA |
+| 2026 年 9 月及之后、基于最新 `release/3.2.2` 构建的日构建 | 已移除该校验，但有些内部 wheel 可能仍把元数据版本写成 `3.2.2` | 必须通过来源、哈希或安装内容确认 |
+| 官方 `3.2.2.post2` | 包含后续修复，可与原始 `3.2.2` 明确区分 | `3.2.x` 线上推荐版本 |
+| 2026 年 9 月及之后的 `3.6.0` 日构建 | 已移除该校验 | 可以用于 UVA，但仍需验证完整软件栈 |
+| 官方 `3.6.0` | 已包含修复 | 新版本软件栈可优先使用 |
+
+需要特别注意 Python 包版本的精确匹配规则：
+
+```text
+triton-ascend==3.2.2
+```
+
+只会选择版本元数据严格匹配 `3.2.2` 的包，不会自动选择：
+
+```text
+triton-ascend==3.2.2.post2
+```
+
+因此，“`release/3.2.2` 分支上的最新源码已经修复”和“安装 `triton-ascend==3.2.2` 一定得到修复后的 wheel”是两个不同结论。对于公共依赖和可复现构建，应显式使用 `3.2.2.post2`；如果使用版本号仍为 `3.2.2` 的内部重构 wheel，应记录下载地址和 SHA256。
+
+### 4.2 当前服务器镜像中的版本判断
+
+当前镜像返回的信息是：
+
+```text
+metadata version: 3.6.0+dev20261007182438
+dist-info: /usr/local/python3.11.10/lib/python3.11/site-packages/
+           triton_ascend-3.6.0+dev20261007182438.dist-info
+wheel: triton_ascend-3.6.0+dev20261007182438-cp311-cp311-
+       manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl
+sha256: 39dbee1d3cef09a9a36dbaef85ee6d5095763b5edca2151235a1e78c08d3157c
+```
+
+该版本是 2026 年 10 月 7 日的 `3.6.0` 日构建，晚于 Triton-Ascend 维护者在 2026 年 9 月 18 日确认 `3.6` 日构建已移除 `location.type` 校验的时间。因此，从版本和构建时间判断，该 wheel 应当已经包含 UVA 修复，并且不会被当前分支按版本号禁用。
+
+导入 `triton` 时出现的以下信息：
+
+```text
+FutureWarning: triton.language.extra.cann.extension.* is deprecated
+```
+
+只是 CANN 扩展 API 的弃用提示，与 UVA pointer 校验无关。
+
+由于该 wheel 的 `direct_url.json` 只记录了容器内的 `file:///tmp/...` 临时路径，并未记录上游 Git commit，SHA256 也没有公开的 commit 对照表，所以仍建议在镜像内检查实际安装内容：
+
+```bash
+TRITON_ROOT=$(PYTHONWARNINGS=ignore::FutureWarning python -c \
+'import pathlib,triton; print(pathlib.Path(triton.__file__).resolve().parent)')
+
+grep -RnsC 8 \
+  --include='*.py' \
+  -E 'location\.type|aclrtPointerGetAttributes' \
+  "$TRITON_ROOT/backends/ascend"
+```
+
+判断标准：
+
+- 如果仍存在“输入指针的 `location.type` 必须是 device memory，否则抛出异常”的逻辑，则该构建不能用于真实 UVA；
+- 如果没有这段参数校验，则说明 Triton 侧修复已经包含；
+- 如果关键字出现在其他内存管理路径中，需要结合前后代码判断，不能仅凭关键字存在就认定 UVA 不可用。
+
+### 4.3 Triton 修复不等于完整 UVA 链路通过
+
+即使 `triton-ascend` 已移除校验，真实 UVA 仍要求：
+
+- `PYTORCH_NPU_ALLOC_CONF` 包含 `pinned_mem_register:True`；
+- `torch_npu` 包含 pinned host registration 和映射相关修复；
+- CANN 版本不低于 9.0；
+- Driver 版本不低于 26.0，且满足 UVA 对商用驱动版本的要求；
+- vLLM Ascend C++ 扩展能够通过 `aclrtHostGetDevicePointer` 创建 NPU view；
+- Triton kernel 能直接读取该 view，并观察到 CPU 对 pinned memory 的更新。
+
+在 NPU 容器中可以使用以下测试验证最后两项：
+
+```bash
+export PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True
+
+pytest -sv \
+  tests/e2e/nightly/single_node/ops/singlecard_ops/test_uva_view.py \
+  -k "npu_view_reads_cpu_updates_without_copy or npu_view_keeps_cpu_storage_alive"
+```
+
+只有这些测试实际执行并通过，才能确认当前镜像中的 Triton、TorchNPU、CANN、Driver 和 vLLM Ascend 映射实现共同打通了真实 UVA。仅看到版本号符合预期，不应直接作为完整 UVA 验证通过的证据。
+
+## 5. 与 vLLM 0.30.0 release 线的关系
 
 当前容器更接近以下组合：
 
@@ -190,7 +294,7 @@ vLLM v0.30.0 + vLLM-Ascend v0.30.0rc2 + UVA 修改
 
 不能把路线 A 的分支代码直接当作路线 B 的代码使用，除非额外补充 upstream vLLM 0.30.0 的兼容处理。
 
-## 5. 后续验证顺序
+## 6. 后续验证顺序
 
 在正式运行 Qwen3-30B-A3B 服务前，建议按以下顺序进行：
 
@@ -204,7 +308,7 @@ vLLM v0.30.0 + vLLM-Ascend v0.30.0rc2 + UVA 修改
 
 在版本基线未统一前，继续调整服务启动参数没有意义，因为当前错误发生在模型加载前的 Python import 阶段。
 
-## 6. 当前验证边界
+## 7. 当前验证边界
 
 截至本文记录时：
 
@@ -221,3 +325,7 @@ vLLM v0.30.0 + vLLM-Ascend v0.30.0rc2 + UVA 修改
 
 - [vLLM-Ascend v0.30.0rc1 release checklist](https://github.com/vllm-project/vllm-ascend/issues/17749)
 - [vLLM-Ascend v0.30.0rc2 environment update](https://github.com/vllm-project/vllm-ascend/issues/18977)
+- [Triton-Ascend UVA pointer validation issue #783](https://github.com/triton-lang/triton-ascend/issues/783)
+- [Triton-Ascend PR #1759](https://github.com/triton-lang/triton-ascend/pull/1759)
+- [Triton-Ascend official releases](https://github.com/triton-lang/triton-ascend/releases)
+- [Python package version specifiers](https://packaging.python.org/en/latest/specifications/version-specifiers/)
