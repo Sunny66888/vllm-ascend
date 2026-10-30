@@ -1523,10 +1523,18 @@
 #       Upstream does not provide an Ascend accelerator-view hook and its
 #       fallback does not cover every Ascend dtype or sparse-update path.
 #    How：
-#       Map registered pinned CPU storage to an NPU-typed view when the runtime
-#       supports it, otherwise copy only modified rows asynchronously to NPU.
+#       When explicitly configured, require the mapped-host-load hardware
+#       capability, inspect the installed Triton launcher for its known pointer
+#       rejection, and map registered pinned CPU storage to an NPU-typed view
+#       only when the hardware, launcher, and runtime support it. Otherwise copy
+#       only modified rows asynchronously to NPU.
 #    Related PR (if no, explain why):
-#       https://github.com/vllm-project/vllm/issues/50261
+#       https://github.com/vllm-project/vllm/pull/56908
+#       https://github.com/triton-lang/triton-ascend/issues/783
+#       https://github.com/triton-lang/triton-ascend/pull/1759
+#    Known Limitation:
+#       A2 masked loads from mapped host memory remain disabled in PR CI while
+#       https://github.com/triton-lang/triton-ascend/issues/2723 is unresolved.
 #    Future Plan:
 #       Remove this patch after upstream exposes platform hooks for the UVA
 #       accelerator view and fallback allocation/copy behavior.

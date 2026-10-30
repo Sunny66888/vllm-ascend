@@ -18,23 +18,70 @@
 #
 import os
 from collections.abc import Callable, Sequence
+from functools import cache
+from importlib.util import find_spec
+from pathlib import Path
 
 import numpy as np
 import torch
 import vllm.v1.worker.gpu.buffer_utils
 from vllm.logger import logger
 
+from vllm_ascend.device.hardware_profile import HardwareCapability, get_current_hardware_profile
 
-def is_uva_available() -> bool:
-    """Return whether registered pinned memory was requested.
+_TRITON_HOST_POINTER_REJECTION_MARKERS = (
+    "attributes.location.type",
+    "cannot be accessed from Triton",
+)
 
-    The wrapper exposes mapped host storage as an NPU-typed tensor, so Triton
-    never receives the CPU tensor that older launchers rejected. Mapping
-    support is checked for every allocation by
-    ``get_npu_view_from_cpu_tensor``; an unavailable mapping keeps using the
-    asynchronous H2D fallback.
+
+def is_real_uva_requested() -> bool:
+    """Return whether the allocator was configured for mapped pinned memory."""
+    allocator_options = os.environ.get("PYTORCH_NPU_ALLOC_CONF", "").split(",")
+    return any(option.strip() == "pinned_mem_register:True" for option in allocator_options)
+
+
+def supports_real_uva_hardware() -> bool:
+    """Return whether the active profile supports Triton mapped-host loads."""
+    return get_current_hardware_profile().supports(HardwareCapability.TRITON_MAPPED_HOST_LOAD)
+
+
+def _launcher_source_allows_mapped_host_pointers(source: str) -> bool:
+    """Check for the host-pointer rejection removed by Triton-Ascend #1759."""
+    return not all(marker in source for marker in _TRITON_HOST_POINTER_REJECTION_MARKERS)
+
+
+@cache
+def triton_launcher_allows_mapped_host_pointers() -> bool:
+    """Return whether the installed launcher lacks the known UVA rejection.
+
+    Version checks cannot distinguish the original 3.2.2 wheel from rebuilt
+    packages containing Triton-Ascend #1759. Inspecting the installed launcher
+    also works for vendor and daily builds that keep the same package version.
+    When the source cannot be inspected, keep the explicit-copy fallback.
     """
-    return "pinned_mem_register:True" in os.environ.get("PYTORCH_NPU_ALLOC_CONF", "")
+    try:
+        driver_spec = find_spec("triton.backends.ascend.driver")
+    except (ImportError, AttributeError, ValueError):
+        driver_spec = None
+
+    if driver_spec is None or driver_spec.origin is None:
+        logger.warning_once("Cannot inspect the Triton-Ascend launcher; using the async H2D fallback for UVA")
+        return False
+
+    try:
+        source = Path(driver_spec.origin).read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        logger.warning_once("Cannot read the Triton-Ascend launcher; using the async H2D fallback for UVA")
+        return False
+
+    if not _launcher_source_allows_mapped_host_pointers(source):
+        logger.warning_once(
+            "The Triton-Ascend launcher rejects mapped host pointers; using the async H2D fallback for UVA. "
+            "See https://github.com/triton-lang/triton-ascend/issues/783"
+        )
+        return False
+    return True
 
 
 def get_row_indices_from_key(key: int | slice | tuple, dim_size: int) -> set[int]:
@@ -125,26 +172,41 @@ class UvaBufferWrapper:
     """Provide mapped UVA views with an explicit-copy fallback on Ascend.
 
     Set ``PYTORCH_NPU_ALLOC_CONF=pinned_mem_register:True`` before process
-    startup to request registered pinned allocations. The runtime mapping
-    result, rather than the Triton package version, decides which path is used.
+    startup to request registered pinned allocations. The installed Triton
+    launcher and the runtime mapping result decide whether the mapped view is
+    safe to expose; otherwise the wrapper keeps using the copy fallback.
     """
 
     def __init__(self, size: int | Sequence[int], dtype: torch.dtype):
         self._cpu: torch.Tensor = torch.zeros(size, dtype=dtype, device="cpu", pin_memory=True)
         self._np: np.ndarray = self._cpu.numpy()
         self._modified_indices: set[int] = set()
-        requested_real_uva = is_uva_available()
-        if requested_real_uva:
+        requested_real_uva = is_real_uva_requested()
+        hardware_allows_real_uva = supports_real_uva_hardware()
+        if requested_real_uva and not hardware_allows_real_uva:
+            logger.warning_once(
+                "The current Ascend hardware profile does not support Triton mapped-host loads; "
+                "using the async H2D fallback for UVA"
+            )
+        launcher_allows_real_uva = (
+            requested_real_uva and hardware_allows_real_uva and triton_launcher_allows_mapped_host_pointers()
+        )
+        if launcher_allows_real_uva:
             import vllm_ascend.vllm_ascend_C  # type: ignore[import-untyped]  # noqa: F401
 
-        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(self._cpu) if requested_real_uva else None
+        view = torch.ops._C_ascend.get_npu_view_from_cpu_tensor(self._cpu) if launcher_allows_real_uva else None
         self._use_real_uva = view is not None
-        if requested_real_uva and not self._use_real_uva:
+        if launcher_allows_real_uva and not self._use_real_uva:
             logger.warning_once("Pinned CPU memory is not mapped for NPU UVA; using the async H2D fallback")
         self._uva: torch.Tensor = view if view is not None else _zeros_on_npu(self._cpu)
 
     def _mark_cpu_modified(self, key: int):
         self._modified_indices.add(key)
+
+    @property
+    def uses_real_uva(self) -> bool:
+        """Return whether this buffer exposes mapped host storage directly."""
+        return self._use_real_uva
 
     @property
     def cpu(self):

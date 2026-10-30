@@ -62,6 +62,9 @@ skip_tests:
   - tests/e2e/pull_request/four_card/test_graph_mode.py
   # Probabilistic failure, need fix (pooling classification)
   - tests/e2e/pull_request/one_card/_310p/test_classification_310p.py
+  # Keep skipped until the A2 masked host-load issue is resolved and validated.
+  # https://github.com/triton-lang/triton-ascend/issues/2723
+  - tests/e2e/pull_request/one_card/model_runner_v2/test_uva.py
   # Temporarily skipped due to flaky failures, pending investigation
   - tests/e2e/pull_request/two_card/test_qwen3_performance.py
   # Temporarily skipped: this test is currently broken

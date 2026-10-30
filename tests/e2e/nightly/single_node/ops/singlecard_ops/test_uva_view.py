@@ -29,7 +29,12 @@ requires_registered_pinned = pytest.mark.skipif(
     "pinned_mem_register:True" not in os.getenv("PYTORCH_NPU_ALLOC_CONF", ""),
     reason="requires mapped pinned CPU memory",
 )
-requires_triton_uva = pytest.mark.skipif(triton is None, reason="requires Triton-Ascend")
+requires_triton_uva = pytest.mark.skipif(
+    triton is None
+    or not patch_uva.supports_real_uva_hardware()
+    or not patch_uva.triton_launcher_allows_mapped_host_pointers(),
+    reason="requires hardware and a Triton-Ascend launcher that support mapped host memory",
+)
 
 
 if triton is not None:
@@ -138,7 +143,7 @@ def test_npu_view_returns_none_for_unpinned_input():
 
 
 def test_fallback_copies_modified_prefix_and_sparse_rows(monkeypatch):
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: False)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: False)
     buffer = patch_uva.UvaBufferWrapper((4, 2), torch.int32)
 
     buffer.cpu[:2] = torch.tensor([[1, 2], [3, 4]], dtype=torch.int32)
@@ -149,11 +154,13 @@ def test_fallback_copies_modified_prefix_and_sparse_rows(monkeypatch):
 
 
 def test_unmapped_storage_uses_fallback(monkeypatch):
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: True)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: True)
+    monkeypatch.setattr(patch_uva, "supports_real_uva_hardware", lambda: True)
+    monkeypatch.setattr(patch_uva, "triton_launcher_allows_mapped_host_pointers", lambda: True)
     monkeypatch.setattr(torch.ops._C_ascend, "get_npu_view_from_cpu_tensor", lambda _: None)
     buffer = patch_uva.UvaBufferWrapper((2, 2), torch.int32)
 
-    assert not buffer._use_real_uva
+    assert not buffer.uses_real_uva
     buffer.np[0] = [7, 8]
     torch.testing.assert_close(buffer.uva().cpu(), buffer.cpu._tensor)
 
@@ -162,7 +169,7 @@ def test_unmapped_storage_uses_fallback(monkeypatch):
 @pytest.mark.parametrize("input_type", ["list", "numpy", "tensor"])
 def test_pool_fallback_growth_shrink_and_round_robin(monkeypatch, max_concurrency, input_type):
     monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: True)
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: False)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: False)
     pool = buffer_utils.UvaBufferPool((2, 2), torch.int32, max_concurrency=max_concurrency)
 
     for step, length in enumerate((2, 5, 1, 6, 3)):
@@ -186,10 +193,12 @@ def test_pool_fallback_growth_shrink_and_round_robin(monkeypatch, max_concurrenc
 
 @requires_registered_pinned
 def test_real_path_uses_npu_typed_view(monkeypatch):
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: True)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: True)
+    monkeypatch.setattr(patch_uva, "supports_real_uva_hardware", lambda: True)
+    monkeypatch.setattr(patch_uva, "triton_launcher_allows_mapped_host_pointers", lambda: True)
     buffer = patch_uva.UvaBufferWrapper((4, 2), torch.int32)
 
-    assert buffer._use_real_uva
+    assert buffer.uses_real_uva
     assert buffer.cpu.device.type == "cpu"
     assert buffer.uva().device.type == "npu"
     assert buffer.uva().shape == buffer.cpu.shape
@@ -198,7 +207,9 @@ def test_real_path_uses_npu_typed_view(monkeypatch):
 @requires_registered_pinned
 def test_pool_real_path_returns_mapped_view(monkeypatch):
     monkeypatch.setattr(buffer_utils, "is_uva_available", lambda: True)
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: True)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: True)
+    monkeypatch.setattr(patch_uva, "supports_real_uva_hardware", lambda: True)
+    monkeypatch.setattr(patch_uva, "triton_launcher_allows_mapped_host_pointers", lambda: True)
     pool = buffer_utils.UvaBufferPool((2, 2), torch.int32, max_concurrency=2)
 
     result = pool.copy_to_uva(np.array([[1, 2], [3, 4]], dtype=np.int32))

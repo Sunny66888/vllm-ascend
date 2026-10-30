@@ -158,6 +158,9 @@ class HardwareCapability(Enum):
     SWIGLU_OAI_MX_QUANT = auto()
     # Use the Triton batch-memcpy kernel for Mamba state copies.
     TRITON_BATCH_MEMCPY = auto()
+    # Allow Triton masked loads from registered, NPU-mapped host memory.
+    # A2 is excluded while triton-ascend#2723 remains unresolved.
+    TRITON_MAPPED_HOST_LOAD = auto()
     # Native TurboQuant 4-bit non-causal MLA cache and SFA kernels.
     TURBOQUANT_4BIT_NC_CACHE = auto()
     # Honor MLAPO enablement on any pipeline role; other profiles limit it to decode consumers.
@@ -280,6 +283,7 @@ _STANDARD_CAPABILITIES = frozenset(
 _A3_CAPABILITIES = _STANDARD_CAPABILITIES | {
     HardwareCapability.MC2_FULLMESH_V2_COMM,
     HardwareCapability.RMS_NORM_CAST,
+    HardwareCapability.TRITON_MAPPED_HOST_LOAD,
 }
 _DEFAULT_WORKER_CLS = "vllm_ascend.worker.worker.NPUWorker"
 _HARDWARE_PROFILES: Mapping[AscendDeviceType, HardwareProfile] = MappingProxyType(

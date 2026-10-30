@@ -34,7 +34,7 @@ class UvaProbeWorker:
         from vllm_ascend.patch.worker.patch_v2.patch_uva import UvaBufferWrapper
 
         buffer = UvaBufferWrapper(4, torch.int32)
-        return buffer._use_real_uva and buffer.uva().device.type == "npu"
+        return buffer.uses_real_uva and buffer.uva().device.type == "npu"
 
 
 @pytest.mark.parametrize("model", MODELS)
@@ -70,4 +70,6 @@ def test_qwen3_dense_eager_and_graph_mode(
         worker_extension_cls=f"{__name__}.UvaProbeWorker",
     ) as runner:
         assert runner.model.collective_rpc("check_real_uva_mapping") == [True]
-        runner.model.generate(prompts, sampling_params)
+        outputs = runner.model.generate(prompts, sampling_params)
+
+    assert len(outputs) == len(prompts)

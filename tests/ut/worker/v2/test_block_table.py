@@ -24,7 +24,9 @@ def test_encoder_only_zero_cache_groups_initialize_and_compute(monkeypatch) -> N
     # CPU CI cannot allocate Ascend pinned memory. Only substitute that device
     # facility; the production AscendBlockTables constructor remains real.
     monkeypatch.setattr(torch, "zeros", zeros_without_pinning)
-    monkeypatch.setattr(patch_uva, "is_uva_available", lambda: True)
+    monkeypatch.setattr(patch_uva, "is_real_uva_requested", lambda: True)
+    monkeypatch.setattr(patch_uva, "supports_real_uva_hardware", lambda: True)
+    monkeypatch.setattr(patch_uva, "triton_launcher_allows_mapped_host_pointers", lambda: True)
     monkeypatch.setitem(
         sys.modules,
         "vllm_ascend.vllm_ascend_C",
