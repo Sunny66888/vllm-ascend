@@ -30,6 +30,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 
 from vllm_ascend.ascend_config import get_ascend_config
+from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.gdn_attn_builder import AscendGDNHostMetadataBackend, AscendGDNHostMetadataBuilder
 from vllm_ascend.attention.utils import (
     maybe_save_kv_layer_to_connector,
@@ -50,7 +51,7 @@ if TYPE_CHECKING:
 
 def prepare_glm_pcp_config(vllm_config):
     if (
-        vllm_config.parallel_config.pcp_shard_decode_requests
+        is_pcp_decode_sharding_enabled(vllm_config)
         and vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs()
     ):
         return prepare_recurrent_pcp_config(vllm_config)
@@ -60,7 +61,7 @@ def prepare_glm_pcp_config(vllm_config):
 class Glm5NextPCPMetadataMixin:
     def _init_pcp_permutation(self, vllm_config, device, decode_cudagraph_max_bs: int) -> None:
         self._pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-        self._is_pcp_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self._is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         self._pcp_gather_indices: torch.Tensor | None = None
         if self._pcp_size > 1:
             capacity = max(vllm_config.scheduler_config.max_num_batched_tokens, decode_cudagraph_max_bs)
@@ -405,7 +406,7 @@ class Glm5NextLinearAttention(GatedDeltaNetAttention):
         self.pcp_group = get_pcp_group()
         self.pcp_size = self.pcp_group.world_size
         self.pcp_rank = self.pcp_group.rank_in_group
-        self.is_pcp_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         self.use_pcp_head_sharding = self.pcp_size > 1
         column_linear = ColumnParallelLinear
         merged_linear = _Glm5NextMergedColumnParallelLinear

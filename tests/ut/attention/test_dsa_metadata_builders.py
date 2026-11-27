@@ -446,6 +446,7 @@ class TestDSAMetadataBuilders(TestCase):
                     results = []
                     global_common = self.common.replace(causal=True, seq_lens=torch.tensor([10], dtype=torch.int32))
                     context = SimpleNamespace(
+                        graph_uniform_query_len=1,
                         global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([prefill]), num_reqs=1),
                         global_block_tables=[torch.tensor([[10, 11]]), torch.tensor([[20, 21]])],
                         global_slot_mappings=[torch.tensor([40, 41]), torch.tensor([80, 81])],
@@ -457,7 +458,9 @@ class TestDSAMetadataBuilders(TestCase):
                         builder._is_decode_sharded = sharded
                         builder._prepare_graph_pcp_context = Mock(return_value=context)
                         builder._build_global_common_attn_metadata = Mock(return_value=global_common)
-                        builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+                        builder._build_graph_common_attn_metadata = Mock(
+                            side_effect=lambda common, actual, uniform_query_len=None: common
+                        )
                         builder._build_local_common_attn_metadata = Mock(return_value=self.common.replace(causal=True))
                         result = builder.build(
                             0,
@@ -498,6 +501,7 @@ class TestDSAMetadataBuilders(TestCase):
     def test_pcp_shares_preparation_but_preserves_group_addresses(self):
         shared: dict[Any, Any] = {}
         context = SimpleNamespace(
+            graph_uniform_query_len=1,
             global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([True]), num_reqs=1),
             global_block_tables=[torch.tensor([[10]]), torch.tensor([[20]])],
             global_slot_mappings=[torch.tensor([1, 2]), torch.tensor([3, 4])],
@@ -509,7 +513,9 @@ class TestDSAMetadataBuilders(TestCase):
             builder._is_decode_sharded = False
             builder._prepare_graph_pcp_context = Mock(return_value=context)
             builder._build_global_common_attn_metadata = Mock(return_value=self.common)
-            builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+            builder._build_graph_common_attn_metadata = Mock(
+                side_effect=lambda common, actual, uniform_query_len=None: common
+            )
             builder._build_local_common_attn_metadata = Mock(return_value=self.common)
             builder._build_local_dsa_metadata = Mock(return_value=SimpleNamespace())
             builder._global_metadata_builder = SimpleNamespace(build=Mock(return_value=SimpleNamespace()))
@@ -542,6 +548,7 @@ class TestDSAMetadataBuilders(TestCase):
         local_proxy.copy_to_buffers.return_value = (local_cos, local_sin)
         self.rope_op.side_effect = [(proxy, object()), (local_proxy, object())]
         context = SimpleNamespace(
+            graph_uniform_query_len=1,
             global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([False]), num_reqs=1),
             global_block_tables=[torch.tensor([[10, 11]]), torch.tensor([[20, 21]])],
             global_slot_mappings=[torch.tensor([40, 41]), torch.tensor([80, 81])],
@@ -558,7 +565,9 @@ class TestDSAMetadataBuilders(TestCase):
             builder.vllm_config.compilation_config.cudagraph_mode.has_full_cudagraphs = lambda: True
             builder._prepare_graph_pcp_context = Mock(return_value=context)
             builder._build_global_common_attn_metadata = Mock(return_value=self.common)
-            builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+            builder._build_graph_common_attn_metadata = Mock(
+                side_effect=lambda common, actual, uniform_query_len=None: common
+            )
             builder._build_local_common_attn_metadata = Mock(return_value=self.common)
             results.append(
                 builder.build(
@@ -581,6 +590,7 @@ class TestDSAMetadataBuilders(TestCase):
         builder._global_metadata_builder = make_builder(dsa_v1.AscendDSAAttentionMetadataBuilder, 4)
         builder._is_decode_sharded = True
         context = SimpleNamespace(
+            graph_uniform_query_len=1,
             global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([False]), num_reqs=1),
             global_block_tables=[self.common.block_table_tensor],
             global_slot_mappings=[self.common.slot_mapping],
@@ -588,7 +598,9 @@ class TestDSAMetadataBuilders(TestCase):
         )
         builder._prepare_graph_pcp_context = Mock(return_value=context)
         builder._build_global_common_attn_metadata = Mock(return_value=self.common)
-        builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+        builder._build_graph_common_attn_metadata = Mock(
+            side_effect=lambda common, actual, uniform_query_len=None: common
+        )
         builder._build_local_common_attn_metadata = Mock(
             return_value=self.common.replace(
                 num_actual_tokens=0,
@@ -615,6 +627,7 @@ class TestDSAMetadataBuilders(TestCase):
     def test_full_pcp_builders_share_base_cache_without_sharing_graph_preparation(self):
         shared: dict[Any, Any] = {}
         context = SimpleNamespace(
+            graph_uniform_query_len=1,
             global_batch=SimpleNamespace(is_prefilling_np=torch.tensor([True]), num_reqs=1),
             global_block_tables=[torch.tensor([[10]]), torch.tensor([[20]])],
             global_slot_mappings=[torch.tensor([1, 2]), torch.tensor([3, 4])],
@@ -627,7 +640,9 @@ class TestDSAMetadataBuilders(TestCase):
                 builder._is_decode_sharded = False
                 builder._prepare_graph_pcp_context = Mock(return_value=context)
                 builder._build_global_common_attn_metadata = Mock(return_value=self.common)
-                builder._build_graph_common_attn_metadata = Mock(side_effect=lambda common, actual: common)
+                builder._build_graph_common_attn_metadata = Mock(
+                    side_effect=lambda common, actual, uniform_query_len=None: common
+                )
                 builder._build_local_common_attn_metadata = Mock(return_value=self.common)
                 builder._global_metadata_builder = SimpleNamespace(build=Mock(return_value=SimpleNamespace()))
 

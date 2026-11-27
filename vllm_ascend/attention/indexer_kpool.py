@@ -31,6 +31,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
+from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.context_parallel.sfa_dcp_utils import get_sfa_pcp_global_metadata
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata, has_requests_to_run_as_prefill
 from vllm_ascend.core.kv_cache_interface import (
@@ -300,7 +301,7 @@ class AscendIndexerKPoolMetadataBuilder(AttentionMetadataBuilder):
         self.kernel_block_size = kv_cache_spec.block_size
         self.compress_ratio = compress_ratio
         self.pcp_size = vllm_config.parallel_config.prefill_context_parallel_size
-        self.is_pcp_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         if self.kernel_block_size <= 0 or self.logical_block_size % self.kernel_block_size:
             raise ValueError(
                 "GLM-Next logical block size must contain whole kernel blocks: "
@@ -670,7 +671,7 @@ class AscendIndexerKPoolTailMetadataBuilder(AttentionMetadataBuilder):
             )
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
         self.block_size = kv_cache_spec.ring_capacity
-        self.is_pcp_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self.is_pcp_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         # Persistent rings are separate from temporary CANN state pages.
         self._max_num_metadata_reqs = max(
             vllm_config.scheduler_config.max_num_seqs, vllm_config.scheduler_config.max_num_batched_tokens

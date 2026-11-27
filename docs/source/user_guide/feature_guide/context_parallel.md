@@ -68,8 +68,9 @@ For supported models, decode requests are sharded when
 `--prefill-context-parallel-size` is greater than 1 and
 `--decode-context-parallel-size` is 1. Each decode request in a batch is
 assigned to one PCP rank in round-robin order, including during speculative
-target verification. When `--decode-context-parallel-size` is greater than 1,
-decode requests remain replicated across PCP ranks.
+target verification with fixed draft lengths. When adaptive verification is
+enabled, or `--decode-context-parallel-size` is greater than 1, decode requests
+remain replicated across PCP ranks.
 
 When PCP size is greater than 1, PCP stores embedding and LM Head weights as TP×PCP resident shards by default for every supported attention backend. Set `enable_pcp_embedding_lmhead_weight_sharding` to `false` to disable this behavior.
 
@@ -116,6 +117,48 @@ For either method, remove `--enforce-eager` and add the following option to use 
 --compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
 ```
 
+##### Adaptive verification with PCP
+
+Model Runner V2 can retain a different number of draft tokens per verification
+request. Set `enable_adaptive_verification` in the speculative configuration of
+a supported SFA or DeepSeek-V4 DSA model, and use `FULL_DECODE_ONLY` graphs:
+
+```bash
+--speculative-config '{"method": "mtp", "num_speculative_tokens": 5, "enable_adaptive_verification": true}' \
+--compilation-config '{"cudagraph_mode": "FULL_DECODE_ONLY"}'
+```
+
+All compatibility changes are contained in vLLM Ascend and use unmodified
+vLLM main. The Ascend platform adapter uses a constant per-batch draft limit
+to disable synthetic prompt-tail admission while retaining real drafts. The
+worker adapter extends the AV module's existing TP agreement to PCP without
+changing its factory interface. NPU integration and performance validation of
+this main-based port are still pending.
+
+Every PCP rank receives the entire compacted verification prefix; ordinary
+prefill tokens are still partitioned. For example, if requests A and B retain
+3 and 1 query tokens, both ranks receive `[A0, A1, A2, B0]`. A following long
+prefill request is split across the two ranks. Device query offsets `[0, 3, 4]`
+describe the actual attention boundaries. CPU offsets may instead be `[0, 2, 4]`
+as placeholders with the same total, while CPU scheduling lengths retain their
+original upper bounds for capacity planning. The CPU placeholders must never
+replace the device attention boundaries.
+
+TP and PCP ranks agree on the cost curves, total draft budget and per-request
+admitted draft counts. Graph request capacity and uniform query width come from
+the selected graph descriptor, including steps that retain zero drafts. AV does
+not enable an unsupported attention backend, speculative method, or topology;
+the existing capability checks still apply. In particular, DeepSeek-V4.1 CP+AV,
+pipeline parallelism with AV, and general dynamic draft lengths remain outside
+this implementation's scope.
+
+The four-card regression is
+`tests/e2e/pull_request/four_card/context_parallel/test_accuracy_v2.py::test_sfa_pcp_adaptive_verification`.
+It compares AV OFF/ON outputs with PCP2 and DCP1/DCP4, checks that all four ranks
+actually trim drafts, and repeats generation to exercise prefix caching. Its
+test-only cost curves deliberately favor zero drafts; they are not performance
+tuning recommendations.
+
 #### Constraints
 
 - In P/D disaggregation, enable PCP only on the prefill (`kv_producer`) engine; the decode (`kv_consumer`) engine must use `prefill_context_parallel_size=1`.
@@ -129,7 +172,8 @@ For either method, remove `--enforce-eager` and add the following option to use 
 - Encoder-decoder models and LoRA are not supported with PCP.
 - PCP and DCP can be stacked for MLA and SFA. GQA does not support DCP. See
   [Combining PCP and DCP](#combining-pcp-and-dcp) for the supported sizes.
-- Adaptive verification is not supported with PCP speculative decoding.
+- Adaptive verification with PCP requires the backend/graph support and Ascend
+  compatibility adapters described above.
 - Dynamic draft lengths are outside the currently validated scope.
 
 ### Decode Context Parallel

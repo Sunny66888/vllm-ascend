@@ -512,6 +512,7 @@ def _batch(world, rank, scenario, *, decode_sharded=False):
     for peer, ids in enumerate(rows):
         gathered_slots[peer, : len(ids)] = slots[ids]
     context = AscendPCPAttentionContext(
+        graph_uniform_query_len=1,
         global_batch=global_batch,
         global_block_tables=(tables, tables + 16),
         global_slot_mappings=torch.stack([global_slots, torch.where(global_slots >= 0, global_slots + 128, -1)]),

@@ -1503,12 +1503,47 @@
 #       the runner still passes the global request count, so no uniform decode
 #       graph matches.
 #    How:
-#       When `parallel_config.pcp_shard_decode_requests` holds, derive the request
-#       count from the local tokens and the uniform query length.
+#       Use the shared AV-aware PCP sharding policy. For sharded fixed-width
+#       decode, derive the request count from local tokens and query length.
+#       AV verification remains replicated and keeps the global request count.
 #    Related PR (if no, explain why):
 #       No upstream PR yet; vLLM #52162 still passes the global request count.
 #    Future Plan:
 #       Remove once upstream dispatches sharded PCP decode with local counts.
+#
+# ** File: platform/patch_adaptive_verification.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.core.sched.scheduler.Scheduler.__init__`
+#    Why:
+#       CP+AV cannot treat a prompt tail's synthetic draft placeholders as a
+#       real verification request. Upstream's uniform admission adds them.
+#    How:
+#       After normal construction, install a constant per-batch draft lookup
+#       for CP+AV only. Upstream's explicit draft-policy admission omits fake
+#       placeholders while the constant limit preserves real draft scheduling
+#       and lookahead. Existing user policies and non-CP/non-AV are unchanged.
+#       Register before the BalanceScheduler alias so AsyncScheduler and other
+#       subclasses inherit the same constructor. Do not fork schedule().
+#    Related PR (if no, explain why):
+#       Ascend-only adaptation to unmodified vLLM main; no upstream PR yet.
+#    Future Plan:
+#       Remove once supported vLLM versions omit synthetic admission under AV.
+#
+# ** File: worker/patch_adaptive_verification.py **
+# ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+#   1. `vllm.v1.worker.gpu.spec_decode.adaptive_verification.get_tp_group`
+#    Why:
+#       TP-only agreement does not keep PCP replicas' budgets/boundaries equal.
+#    How:
+#       Rebind only this module's agreement getter to a TP-then-PCP broadcast
+#       adapter. Existing curve, scalar-budget and device-count broadcasts all
+#       use it; with PCP1 it returns the original TP group. Factory signatures,
+#       budget kernels and admitted-count D2H ordering remain upstream-owned.
+#    Related PR (if no, explain why):
+#       Ascend-only adaptation to unmodified vLLM main; no upstream PR yet.
+#    Future Plan:
+#       Remove when upstream AV agreement includes PCP. Keep regression tests
+#       guarding all three synchronization points until then.
 #
 # ** 33. File: platform/patch_vision.py**
 # ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

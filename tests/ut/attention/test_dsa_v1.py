@@ -1935,6 +1935,7 @@ def test_pcp_graph_decode_builds_only_local_metadata(is_dummy: bool):
         torch.tensor([3, 1, 2, 0], dtype=torch.int64) if is_dummy else torch.tensor([1, 0, 7, 6], dtype=torch.int64)
     )
     pcp_context = AscendPCPAttentionContext(
+        graph_uniform_query_len=1,
         global_batch=global_batch,
         global_block_tables=(torch.arange(graph_size, dtype=torch.int32).view(-1, 1),),
         global_slot_mappings=global_slot_mappings,
@@ -2050,6 +2051,7 @@ def test_pcp_graph_metadata_restores_mtp_query_offsets():
     actual = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
         common_metadata,
         num_actual_reqs=2,
+        uniform_query_len=2,
     )
 
     assert actual is common_metadata
@@ -2057,6 +2059,42 @@ def test_pcp_graph_metadata_restores_mtp_query_offsets():
     replace_kwargs = common_metadata.replace.call_args.kwargs
     assert torch.equal(replace_kwargs["query_start_loc"], expected_query_start_loc)
     assert torch.equal(replace_kwargs["query_start_loc_cpu"], expected_query_start_loc)
+
+
+@pytest.mark.parametrize(
+    "device_offsets,host_offsets",
+    [([0, 3, 4, 4, 4], [0, 2, 4, 4, 4]), ([0, 1, 2, 2, 2], [0, 1, 2, 2, 2])],
+    ids=["unequal-drafts", "zero-drafts"],
+)
+def test_pcp_variable_graph_preserves_device_boundaries(device_offsets, host_offsets):
+    device_queries = torch.tensor(device_offsets, dtype=torch.int32)
+    host_queries = torch.tensor(host_offsets, dtype=torch.int32)
+    seq_lens = torch.tensor([16, 16, 0, 0], dtype=torch.int32)
+    common = AscendCommonAttentionMetadata(
+        query_start_loc=device_queries,
+        query_start_loc_cpu=host_queries,
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        seq_lens_cpu_upper_bound=seq_lens.clone(),
+        num_reqs=4,
+        num_actual_tokens=device_offsets[-1],
+        max_query_len=6,
+        max_seq_len=16,
+        block_table_tensor=torch.zeros((4, 1), dtype=torch.int32),
+        slot_mapping=torch.full((8,), -1, dtype=torch.int64),
+        positions=torch.arange(8),
+        attn_state="local",
+        num_input_tokens=8,
+        is_prefilling=torch.zeros(4, dtype=torch.bool),
+    )
+    result = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
+        common, num_actual_reqs=2, uniform_query_len=None
+    )
+    assert result is common
+    assert result.query_start_loc is device_queries
+    assert result.query_start_loc_cpu is host_queries
+    assert device_queries.tolist() == device_offsets
+    assert host_queries.tolist() == host_offsets
 
 
 def _attach_parallel_o_proj(impl, pcp_group, *, tp_group=None, decode_sharded=False):

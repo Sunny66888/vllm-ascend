@@ -3,11 +3,19 @@ from typing import Any
 
 import torch
 from vllm import envs
+from vllm.config import VllmConfig
 from vllm.distributed import get_dcp_group, get_pcp_group, get_tp_group
 from vllm.logger import logger
 
 import vllm_ascend.ops.triton.dcp.dcp_a2a  # noqa: F401
 from vllm_ascend.utils import enable_sfa
+
+
+def is_pcp_decode_sharding_enabled(vllm_config: VllmConfig) -> bool:
+    """Keep adaptive verification replicated, including during graph warmup."""
+    speculative_config = getattr(vllm_config, "speculative_config", None)
+    adaptive = speculative_config is not None and getattr(speculative_config, "enable_adaptive_verification", False)
+    return vllm_config.parallel_config.pcp_shard_decode_requests and not adaptive
 
 
 def get_cp_max_num_reqs(vllm_config: Any) -> int:

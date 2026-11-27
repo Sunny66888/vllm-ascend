@@ -13,6 +13,7 @@ from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.kv_cache_interface import AttentionSpec
 
 from vllm_ascend.attention import dsa_v1
+from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.dsa_attn_kv_plan import (
     get_dsa_attn_kv_plan,
 )
@@ -111,7 +112,7 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
         self._pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.use_pcp = self._pcp_world_size > 1
         self._pcp_rank = get_pcp_group().rank_in_group
-        self._is_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self._is_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         self._hidden_restore_idx_buffer = torch.empty(
             vllm_config.scheduler_config.max_num_batched_tokens,
             dtype=torch.int64,
@@ -125,7 +126,7 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
         vllm_config: VllmConfig,
         kv_cache_spec: AttentionSpec,
     ) -> AttentionCGSupport:
-        return AttentionCGSupport.UNIFORM_BATCH
+        return super().get_cudagraph_support(vllm_config, kv_cache_spec)
 
     def _prepare_graph_pcp_context(
         self,
@@ -160,13 +161,15 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
     def _build_graph_common_attn_metadata(
         common_attn_metadata: AscendCommonAttentionMetadata,
         num_actual_reqs: int | None,
+        uniform_query_len: int | None = None,
     ) -> AscendCommonAttentionMetadata:
         """Restore DSA graph request metadata after PCP partitioning.
 
-        PCP preserves the fixed graph token shape, but represents the padded
-        local rows as zero-token requests. DSA requires the query offsets to
-        cover every decode graph token, so expand the padded query offsets in
-        both the NPU and CPU metadata views. A regular decode has one query
+        PCP represents padded local rows as zero-token requests. A selected
+        uniform FULL graph requires those slots to keep its captured query
+        width. Expand only that graph's padding in both NPU and CPU metadata;
+        variable graphs and eager batches retain the supplied offsets.
+        A regular uniform decode has one query
         token per request, while MTP verification has a fixed K+1 query
         length. Padded slot mappings are invalidated separately.
 
@@ -199,8 +202,13 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
         if is_prefilling is not None and bool(is_prefilling.any()):
             return common_attn_metadata
 
-        # FULL_DECODE_ONLY uses the same query length for every request.
-        query_len = common_attn_metadata.num_input_tokens // num_reqs
+        # Only the selected uniform FULL descriptor authorizes expansion.
+        # Equal runtime lengths (or zero drafts) do not identify a graph family.
+        if uniform_query_len is None:
+            return common_attn_metadata
+
+        # Fixed-width FULL_DECODE_ONLY graphs expand padding offsets.
+        query_len = uniform_query_len
         padded_offsets = slice(num_actual_reqs + 1, num_reqs + 1)
         padding_start = (num_actual_reqs + 1) * query_len
         padding_end = (num_reqs + 1) * query_len
@@ -392,6 +400,7 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
                 global_common_attn_metadata = self._build_graph_common_attn_metadata(
                     global_common_attn_metadata,
                     pcp_context.global_batch.num_reqs,
+                    uniform_query_len=pcp_context.graph_uniform_query_len,
                 )
                 shared["pcp_global_common"] = global_common_attn_metadata
             # Physical cache addresses and causality remain group-specific.
@@ -444,6 +453,7 @@ class AscendDSAPCPMetadataBuilder(AscendDSAMetadataBuilder):
             local_common_attn_metadata = self._build_graph_common_attn_metadata(
                 local_common_attn_metadata,
                 num_actual_reqs,
+                uniform_query_len=pcp_context.graph_uniform_query_len,
             )
             shared["pcp_local_offsets"] = (
                 local_common_attn_metadata.query_start_loc,
@@ -541,7 +551,7 @@ class AscendDSAPCPImpl(AscendDSAImpl):
             pool=self.o_proj_full_pools,
             pool_key=self.o_proj_weight_switch_pool_key,
             project_full=super()._forward_o_proj,
-            decode_sharded=self.vllm_config.parallel_config.pcp_shard_decode_requests,
+            decode_sharded=is_pcp_decode_sharding_enabled(self.vllm_config),
             input_layer=self.wo_a,
             input_projection=self._wo_a_bmm,
             num_input_groups=self.n_local_groups,

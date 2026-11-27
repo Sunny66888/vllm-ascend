@@ -97,6 +97,48 @@ def _make_runner(*args, **kwargs):
     return runner
 
 
+@pytest.mark.parametrize("next_step", ["dummy", "inactive", "no-drafts"])
+def test_adaptive_pcp_dispatch_keeps_host_counts_and_clears_next_step(next_step):
+    runner = _make_runner()
+    runner.vllm_config.parallel_config = ParallelConfig(prefill_context_parallel_size=2)
+    runner.vllm_config.speculative_config = SimpleNamespace(enable_adaptive_verification=True)
+    runner.pcp_manager = AscendPCPManager(2, 0, torch.device("cpu"), shard_decode_requests=False)
+    runner.pcp_manager.bind_config(runner.vllm_config)
+    runner.adaptive_verification = Mock()
+    scheduled = np.array([8, 8, 1], dtype=np.int32)
+    drafts = np.array([7, 7, 0], dtype=np.int32)
+    prefilling = np.array([False, False, True])
+    state = BatchReqState(
+        req_ids=["a", "b", "c"],
+        num_tokens=9,
+        num_draft_tokens_np=drafts,
+        num_scheduled_tokens=scheduled,
+        is_prefilling_np=prefilling,
+        idx_mapping_np=np.arange(3, dtype=np.int32),
+        prefill_len_np=np.ones(3, dtype=np.int32),
+        num_computed_prefill_tokens_np=np.array([1, 1, 0], dtype=np.int32),
+        max_seq_len_np=None,
+        has_prefill=True,
+        prefill_runs_as_decode_np=None,
+        decode_graph_eligible=False,
+    )
+    with patch.object(GPUModelRunner, "gather_batch_req_state", return_value=(state, None)):
+        result, _ = runner.gather_batch_req_state(SimpleNamespace(), False)
+    assert result is state
+    np.testing.assert_array_equal(scheduled, [8, 8, 1])
+    assert runner.pcp_manager.get_num_tokens_for_dispatch(scheduled, prefilling) == 9
+    runner.adaptive_verification.compact_batch.assert_not_called()
+    if next_step == "inactive":
+        runner.adaptive_verification = None
+    elif next_step == "no-drafts":
+        state = state._replace(num_draft_tokens_np=None)
+    with patch.object(
+        GPUModelRunner, "gather_batch_req_state", return_value=(None if next_step == "dummy" else state, None)
+    ):
+        runner.gather_batch_req_state(SimpleNamespace(), next_step == "dummy")
+    assert runner.pcp_manager.get_num_tokens_for_dispatch(scheduled, prefilling) == 17
+
+
 @pytest.mark.parametrize(
     ("dummy", "profile", "fail"),
     [

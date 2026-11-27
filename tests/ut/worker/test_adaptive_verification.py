@@ -19,9 +19,11 @@ from vllm.v1.worker.gpu.spec_decode.dflash import speculator as upstream_dflash
 
 import vllm_ascend.worker.v2.spec_decode.dspark.speculator as dspark_module
 from vllm_ascend.ascend_forward_context import get_mrv2_in_profile_run
+from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSAPCPMetadataBuilder
 from vllm_ascend.attention.dsa_v1 import AscendDSABackend, AscendDSAMetadataBuilder
 from vllm_ascend.attention.indexer import AscendSFAIndexerBackend, AscendSFAIndexerMetadataBuilder
 from vllm_ascend.attention.sfa_v1 import AscendSFABackend, AscendSFAMetadataBuilder
+from vllm_ascend.patch.worker import patch_adaptive_verification as adaptive_patch
 from vllm_ascend.patch.worker import patch_model_runner
 from vllm_ascend.utils import vllm_version_is
 from vllm_ascend.worker.v2.model_runner import NPUModelRunner
@@ -33,7 +35,7 @@ from vllm_ascend.worker.v2.spec_decode.mtp.speculator import AscendMTPSpeculator
 
 @pytest.mark.parametrize(
     "builder_cls",
-    [AscendDSAMetadataBuilder, AscendSFAIndexerMetadataBuilder, AscendSFAMetadataBuilder],
+    [AscendDSAMetadataBuilder, AscendSFAIndexerMetadataBuilder, AscendSFAMetadataBuilder, AscendDSAPCPMetadataBuilder],
 )
 @pytest.mark.parametrize(
     "method,adaptive,num_speculative_tokens,expected_bound",
@@ -188,10 +190,10 @@ def test_adaptive_draft_uses_its_own_request_count(monkeypatch, local_reqs, dp_r
 
 @pytest.fixture
 def cpu_manager_resources(monkeypatch):
-    # Only replace CUDA resources; manager construction and budget selection run unchanged.
-    monkeypatch.setattr(torch.cuda, "Stream", Mock())
-    monkeypatch.setattr(torch.cuda, "Event", Mock())
-    monkeypatch.setattr(torch.cuda, "current_stream", Mock())
+    # Only replace accelerator resources; construction and budget selection run unchanged.
+    monkeypatch.setattr(adaptive, "new_d2h_stream", Mock())
+    monkeypatch.setattr(torch, "Event", Mock())
+    monkeypatch.setattr(torch.accelerator, "current_stream", Mock())
     monkeypatch.setattr(adaptive, "stream", lambda *args: nullcontext())
     monkeypatch.setattr(adaptive, "CpuGpuBuffer", partial(adaptive.CpuGpuBuffer, pin_memory=False))
 
@@ -217,6 +219,7 @@ def _adaptive_manager_kwargs(groups, enabled=True, steps=3):
     )
     config = SimpleNamespace(
         use_v2_model_runner=True,
+        max_concurrent_batches=2,
         speculative_config=SimpleNamespace(
             method="mtp", num_speculative_tokens=3, parallel_drafting=False, max_num_new_slots_for_drafting=0
         ),
@@ -264,8 +267,9 @@ def test_adaptive_verification_admission(cpu_manager_resources, monkeypatch, ena
             assert manager is None
 
 
+@pytest.mark.parametrize("pcp_size", [1, 2])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_adaptive_verification_manager_initialization(cpu_manager_resources, monkeypatch, enabled):
+def test_adaptive_verification_manager_initialization(cpu_manager_resources, monkeypatch, enabled, pcp_size):
     kwargs = _adaptive_manager_kwargs([_attn_group(AscendSFABackend, AscendSFAMetadataBuilder)], enabled=enabled)
     group = kwargs["attn_groups"][0][0]
     group.layer_names = ["target"]
@@ -280,7 +284,7 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
         max_num_blocks_per_req=lambda *args: 1,
     )
     runner = SimpleNamespace(
-        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1),
+        parallel_config=SimpleNamespace(cp_kv_cache_interleave_size=1, prefill_context_parallel_size=pcp_size),
         is_encoder_decoder=False,
         max_model_len=128,
         speculator=speculator,
@@ -323,6 +327,7 @@ def test_adaptive_verification_manager_initialization(cpu_manager_resources, mon
     assert manager_call.call_args.kwargs["enable_adaptive_verification"] is enabled
     assert manager_call.call_args.kwargs["copy_admitted_drafts_to_host"] is False
     assert manager_call.call_args.kwargs["target_layer_names"] == {"target"}
+    assert "pcp_group" not in manager_call.call_args.kwargs
     assert (runner.adaptive_verification is not None) is enabled
     if enabled:
         assert isinstance(runner.adaptive_verification, adaptive.AdaptiveVerificationManager)
@@ -437,3 +442,51 @@ def test_adaptive_verification_budget(cpu_manager_resources, monkeypatch):
     manager.record_confidences(low, batch)
     assert manager.get_num_tokens(scheduled, drafts) == 2
     assert manager._batch_budget == ({"a": 3, "b": 3}, {"a": 1, "b": 1}, 0)
+
+
+@pytest.mark.parametrize("budget", [0, 3, 6])
+def test_adaptive_verification_pcp_consensus(cpu_manager_resources, monkeypatch, budget):
+    """Rank-local estimates and rankings must yield the PCP leader's boundaries."""
+    kwargs = _adaptive_manager_kwargs([_attn_group(AscendSFABackend, AscendSFAMetadataBuilder)])
+    leader_curves = ([(1, 1.0), (2, 1.0)], [(n, float(n)) for n in range(1, 17)])
+    tp_group = Mock()
+    tp_group.broadcast_object.side_effect = lambda value, src: value
+    pcp_group = Mock()
+    pcp_group.world_size = 2
+    pcp_group.broadcast_object.side_effect = [leader_curves, budget]
+
+    def receive_leader_counts(capacities, src):
+        capacities.copy_(torch.tensor([1, 2], dtype=torch.int32))
+
+    pcp_group.broadcast.side_effect = receive_leader_counts
+    monkeypatch.setattr(adaptive_patch, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(adaptive_patch, "get_pcp_group", lambda: pcp_group)
+    monkeypatch.setattr(adaptive, "get_tp_group", adaptive_patch.get_adaptive_verification_group)
+    manager = adaptive.maybe_create_adaptive_verification_manager(**kwargs)
+    manager.set_cost_curves([(1, 100.0), (2, 200.0)], [(1, 200.0), (16, 300.0)])
+    expected = adaptive.build_cost_tables_from_curves(*leader_curves, 2, 16)
+    for actual_table, expected_table in zip(manager.cost_tables, expected):
+        np.testing.assert_array_equal(actual_table, expected_table)
+
+    assert manager.get_num_tokens({"a": 4, "b": 4}, {"a": [1, 2, 3], "b": [4, 5, 6]}) == 2 + budget
+    assert pcp_group.broadcast_object.call_count == 2
+
+    # Substitute only the device-ranking kernel and async transfer. The real
+    # reallocation method must broadcast counts before building both offsets.
+    rank_drafts = Mock(side_effect=lambda probs, mapping, counts, budget, scratch: counts.copy_(torch.tensor([3, 0])))
+    monkeypatch.setattr(adaptive, "assign_draft_token_budget", rank_drafts)
+    monkeypatch.setattr(adaptive, "async_tensor_h2d", lambda value, out: out.copy_(torch.as_tensor(value)))
+    logits, queries, actual_budget, admitted = manager.reallocate_drafts(["a", "b"], torch.tensor([0, 1]))
+    expected_offsets = {0: [0, 1, 2], 3: [0, 2, 5], 6: [0, 4, 8]}[budget]
+    torch.testing.assert_close(queries, torch.tensor(expected_offsets, dtype=torch.int32))
+    torch.testing.assert_close(logits, queries)
+    assert actual_budget == budget
+    assert admitted is None
+    assert rank_drafts.call_count == tp_group.broadcast.call_count == pcp_group.broadcast.call_count == int(budget == 3)
+
+
+def test_adaptive_verification_without_pcp_preserves_tp_group(monkeypatch):
+    tp_group = Mock()
+    monkeypatch.setattr(adaptive_patch, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(adaptive_patch, "get_pcp_group", lambda: SimpleNamespace(world_size=1))
+    assert adaptive_patch.get_adaptive_verification_group() is tp_group

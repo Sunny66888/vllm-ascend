@@ -37,6 +37,8 @@ import vllm_ascend.patch.platform.patch_mamba_manager  # noqa
 if os.getenv("DYNAMIC_EPLB", "false").lower() in ("true", "1") or os.getenv("EXPERT_MAP_RECORD", "false") == "true":
     import vllm_ascend.patch.platform.patch_multiproc_executor  # noqa
 
+# Install on the base Scheduler before BalanceScheduler rebinds its module name.
+import vllm_ascend.patch.platform.patch_adaptive_verification  # noqa
 import vllm_ascend.patch.platform.patch_balance_schedule  # noqa
 import vllm_ascend.patch.platform.patch_engine_core  # noqa
 import vllm_ascend.patch.platform.patch_metrics_level  # noqa

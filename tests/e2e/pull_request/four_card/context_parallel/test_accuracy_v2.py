@@ -483,6 +483,95 @@ def test_dsv3_2_sfa_pcp_dcp_model_runner_v2_graph_accuracy() -> None:
     _run_accuracy_case(DSV3_2_SFA_PCP_DCP_CASE)
 
 
+class AdaptivePCPWorker:
+    """Exercise real compaction with a deterministic, zero-draft cost optimum."""
+
+    model_runner: Any
+
+    def configure_adaptive_regression(self) -> None:
+        from vllm.v1.worker.gpu.spec_decode import adaptive_verification
+
+        from vllm_ascend.patch.worker.patch_adaptive_verification import AdaptiveVerificationGroup
+
+        runner = self.model_runner
+        manager = runner.adaptive_verification
+        assert manager is not None
+        assert isinstance(adaptive_verification.get_tp_group(), AdaptiveVerificationGroup)
+        assert not runner.pcp_manager.is_decode_sharded
+        manager.set_cost_curves(
+            [(1, 1e-6), (runner.max_num_reqs, 1e-6)],
+            [(n, float(2**n)) for n in range(1, runner.max_num_tokens + 1)],
+        )
+        self.trimmed_steps = 0
+        get_num_tokens = manager.get_num_tokens
+
+        def observe_budget(scheduled, drafts):
+            total = get_num_tokens(scheduled, drafts)
+            if total < sum(scheduled.values()):
+                self.trimmed_steps += 1
+            return total
+
+        manager.get_num_tokens = observe_budget
+
+    def get_adaptive_trimmed_steps(self) -> int:
+        return self.trimmed_steps
+
+
+@pytest.mark.parametrize("dcp_size", [1, 4])
+@pytest.mark.e2e_model(DSV3_2_MODEL)
+@pytest.mark.e2e_coverage(
+    arch="moe",
+    feature="sfa_pcp,mtp,chunked_prefill,prefix_caching",
+    parallel="TP,EP,PCP,DCP",
+    deploy="pd_mix",
+    hardware="A3",
+    quantization="W8A8",
+    graph_mode="full_decode_only",
+)
+@patch.dict(
+    os.environ,
+    {
+        "VLLM_BATCH_INVARIANT": "1",
+        "VLLM_WORKER_MULTIPROC_METHOD": "spawn",
+        "HCCL_BUFFSIZE": "768",
+        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+    },
+)
+@wait_until_npu_memory_free(target_free_percentage=0.8)
+def test_sfa_pcp_adaptive_verification(dcp_size: int) -> None:
+    """Compare actual AV OFF/ON generation, including cached prompt tails."""
+    prompts = [ACCURACY_PROMPTS[0], "Explain context parallel attention. " * 48]
+    results = []
+    for adaptive in (False, True):
+        kwargs = {
+            **DSV3_2_SFA_PCP_DCP_CASE.runner_kwargs,
+            "decode_context_parallel_size": dcp_size,
+            "max_num_batched_tokens": 128,
+            "worker_extension_cls": f"{__name__}.AdaptivePCPWorker",
+            "seed": 0,
+            "speculative_config": {
+                "method": "mtp",
+                "num_speculative_tokens": 5,
+                "enable_adaptive_verification": adaptive,
+            },
+        }
+        with VllmRunner(DSV3_2_MODEL, **kwargs) as runner:
+            if adaptive:
+                runner.model.collective_rpc("configure_adaptive_regression")
+            generations = []
+            for _ in range(2):
+                outputs = runner.generate_greedy_logprobs(prompts, 16, num_logprobs=None)
+                token_ids = [ids for ids, _, _ in outputs]
+                assert len(token_ids) == len(prompts) and all(token_ids)
+                generations.append(token_ids)
+            if adaptive:
+                counts = runner.model.collective_rpc("get_adaptive_trimmed_steps")
+                assert len(counts) == 4 and min(counts) > 0
+                assert len(set(counts)) == 1
+            results.append(generations)
+    assert results[0] == results[1]
+
+
 MTP_PCP_CASE = AccuracyCase(
     name="mtp_mla_pcp",
     model=MTP_PCP_MODEL,

@@ -920,6 +920,18 @@ class NPUModelRunner(GPUModelRunner):
             batch_state, uniform_token_count = prepare_flashmla_batch_req_state(batch_state, uniform_token_count)
         if self.pcp_manager is not None:
             self.pcp_manager.set_dispatch_batch_req_state(batch_state)
+            self.pcp_manager.clear_adaptive_dispatch()
+            if (
+                self.adaptive_verification is not None
+                and batch_state is not None
+                and batch_state.num_draft_tokens_np is not None
+            ):
+                self.pcp_manager.set_adaptive_dispatch(
+                    num_tokens_after_av=batch_state.num_tokens,
+                    num_scheduled_tokens=batch_state.num_scheduled_tokens,
+                    num_draft_tokens=batch_state.num_draft_tokens_np,
+                    is_prefilling=batch_state.is_prefilling_np,
+                )
         expert_offload.prepare_batch(self, batch_state)
         return batch_state, uniform_token_count
 

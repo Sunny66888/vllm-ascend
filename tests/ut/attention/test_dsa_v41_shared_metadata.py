@@ -67,7 +67,9 @@ class TestRoleMetadata:
                 )
                 if batch.graph:
                     common = dsa_cp.AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
-                        common, batch.context.global_batch.num_reqs
+                        common,
+                        batch.context.global_batch.num_reqs,
+                        uniform_query_len=batch.context.graph_uniform_query_len,
                     )
                 metadata[kind] = owner.build(
                     0,

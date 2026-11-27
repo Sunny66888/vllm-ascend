@@ -13,6 +13,7 @@ from vllm.forward_context import get_forward_context
 from vllm.v1.worker.gpu.pcp_manager import PCPManager
 
 from vllm_ascend.attention import dsa_v41 as v41
+from vllm_ascend.attention.context_parallel.common_cp import is_pcp_decode_sharding_enabled
 from vllm_ascend.attention.context_parallel.dsa_cp import (
     AscendDSAPCPMetadataBuilder,
 )
@@ -267,7 +268,7 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
         self._pcp_world_size = vllm_config.parallel_config.prefill_context_parallel_size
         self.use_pcp = self._pcp_world_size > 1
         self._pcp_rank = get_pcp_group().rank_in_group
-        self._is_decode_sharded = vllm_config.parallel_config.pcp_shard_decode_requests
+        self._is_decode_sharded = is_pcp_decode_sharding_enabled(vllm_config)
         self._max_tokens = vllm_config.scheduler_config.max_num_batched_tokens
         self._hidden_restore_idx_buffer = torch.empty(self._max_tokens, dtype=torch.int64, device=device)
 
@@ -520,7 +521,9 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
                 )
                 if full_graph_mode:
                     global_common = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
-                        global_common, pcp_context.global_batch.num_reqs
+                        global_common,
+                        pcp_context.global_batch.num_reqs,
+                        uniform_query_len=pcp_context.graph_uniform_query_len,
                     )
                 shared["global_common"] = global_common
             else:
@@ -538,7 +541,9 @@ class AscendDSAV41PCPMetadataBuilder(_ReplicatedCacheMetadataBuilder):
             offsets = shared.get("local_graph_offsets")
             if offsets is None:
                 local_common = AscendDSAPCPMetadataBuilder._build_graph_common_attn_metadata(
-                    local_common, num_actual_reqs
+                    local_common,
+                    num_actual_reqs,
+                    uniform_query_len=pcp_context.graph_uniform_query_len,
                 )
                 offsets = (local_common.query_start_loc, local_common.query_start_loc_cpu)
                 shared["local_graph_offsets"] = offsets
